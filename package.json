@@ -1,0 +1,12 @@
+{
+  "name": "blob-parkour-server",
+  "version": "1.0.0",
+  "description": "Real WebSocket backend for Blob Parkour: server rooms (20-player cap), friends, and invites.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}
