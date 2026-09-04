@@ -251,7 +251,7 @@ wss.on('connection', ws => {
       const me = ensurePlayer(myId);
       const targetId = String(msg.targetId || '');
       if (isOnline(targetId)) send(targetId, { type: 'server_invite', fromName: me.name, fromCountry: me.country || null });
-      else if (data.players[targetId]) { data.players[targetId].pendingInvites.push({ fromName: me.name, fromCountry: me.country || null }); saveData(); }
+      else if (data.players[targetId]) { data.players[targetId].pendingInvites.push({ fromId: myId, fromName: me.name, fromCountry: me.country || null }); saveData(); }
       return;
     }
     if (msg.type === 'server_invite_by_name') {
@@ -261,7 +261,7 @@ wss.on('connection', ws => {
       if (!entry) { send(myId, { type: 'invite_sent', ok: false, name: msg.name }); return; }
       const [targetId, targetP] = entry;
       if (isOnline(targetId)) send(targetId, { type: 'server_invite', fromName: me.name, fromCountry: me.country || null });
-      else { targetP.pendingInvites.push({ fromName: me.name, fromCountry: me.country || null }); saveData(); }
+      else { targetP.pendingInvites.push({ fromId: myId, fromName: me.name, fromCountry: me.country || null }); saveData(); }
       send(myId, { type: 'invite_sent', ok: true, name: targetP.name });
       return;
     }
@@ -365,7 +365,10 @@ wss.on('connection', ws => {
           const f = data.players[fid];
           if (f) f.friends = f.friends.filter(id => id !== myId);
         });
-        Object.values(data.players).forEach(p => { p.incomingRequests = (p.incomingRequests || []).filter(r => r.fromId !== myId); });
+        Object.values(data.players).forEach(p => {
+          p.incomingRequests = (p.incomingRequests || []).filter(r => r.fromId !== myId);
+          p.pendingInvites = (p.pendingInvites || []).filter(inv => inv.fromId !== myId);
+        });
         delete data.players[myId];
         saveData();
       }
