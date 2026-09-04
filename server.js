@@ -2,16 +2,13 @@
 // ---------------------------------------------------------------------
 // This is a genuine WebSocket server: real connections, a real in-memory
 // room registry (capacity-checked at 20 players per room), a real
-// friends graph persisted to disk in data.json, a real live co-op
-// relay (join_level / state / peer_state / peer_left_level below) used
-// for in-level co-op abilities like standing on a teammate's head, and
-// a real cross-room invite/join flow (server_invite carries the
-// inviter's actual room id; join_server actually moves the invitee into
-// that exact room, capacity-checked, with a real player_joined_server
-// notice sent back to the inviter and existing room members).
-// Nothing here is mocked — every player, friend, request, invite, and
-// co-op position update comes from an actual connected client, and the
-// wire protocol below matches exactly what main.js sends and expects
+// friends graph persisted to disk in data.json, and a real live co-op
+// relay (join_level / state / peer_state / peer_left_level / emote /
+// peer_emote below) used for in-level co-op abilities like standing on
+// a teammate's head, and for the emote wheel (quick emoji pop-ups).
+// Nothing here is mocked — every player, friend, request, invite,
+// co-op position update, and emote comes from an actual connected
+// client, and the wire protocol below matches exactly what main.js sends and expects
 // (see the "SOCIAL / MULTIPLAYER" section near the top of main.js).
 //
 // The co-op relay is intentionally a dumb broadcaster: it does not run
@@ -101,21 +98,6 @@ function assignRoom(id) {
   playerRoom.set(id, chosen);
   return chosen;
 }
-
-// Moves an already-connected player into a specific existing room (used
-// when they tap "Join" on a server invite). Unlike assignRoom, this
-// targets one exact room rather than picking any room with space, and
-// fails with a reason if that room is full or no longer exists so the
-// client can show the player something real instead of silently no-op'ing.
-function joinSpecificRoom(id, roomId) {
-  if (!rooms.has(roomId)) return { ok: false, reason: 'not_found' };
-  const members = rooms.get(roomId);
-  if (members.size >= ROOM_CAP) return { ok: false, reason: 'full' };
-  leaveRoom(id); // remove from whatever room they were auto-assigned to first
-  members.add(id);
-  playerRoom.set(id, roomId);
-  return { ok: true, roomId, roomCount: members.size };
-}
 function leaveRoom(id) {
   const rid = playerRoom.get(id);
   if (rid && rooms.has(rid)) {
@@ -138,7 +120,22 @@ function notifyLeftLevel(id) {
 }
 const shortId = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 
-const wss = new WebSocketServer({ port: PORT });
+// A plain http.Server is needed alongside the WebSocket server: `ws`
+// only handles the special "Upgrade: websocket" handshake used by real
+// game clients. Ordinary HTTP requests — like the periodic GET pings
+// from an uptime service (cron-job.org, UptimeRobot, etc.) used to stop
+// this free-tier instance from spinning down, or Render's own health
+// checks — have nothing to answer them otherwise, and error out instead
+// of getting a clean response. This handler just answers any plain HTTP
+// request with 200 OK; it doesn't need to do anything else, since real
+// gameplay traffic never goes through it.
+const http = require('http');
+const httpServer = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Blob Parkour multiplayer server is running.\n');
+});
+const wss = new WebSocketServer({ server: httpServer });
+httpServer.listen(PORT);
 console.log('Blob Parkour multiplayer server listening on port ' + PORT);
 
 wss.on('connection', ws => {
@@ -168,7 +165,7 @@ wss.on('connection', ws => {
       });
 
       if (p.pendingInvites.length) {
-        p.pendingInvites.forEach(inv => send(myId, { type: 'server_invite', fromId: inv.fromId || null, fromName: inv.fromName, fromCountry: inv.fromCountry || null, fromRoomId: inv.fromRoomId || null }));
+        p.pendingInvites.forEach(inv => send(myId, { type: 'server_invite', fromName: inv.fromName, fromCountry: inv.fromCountry || null }));
         p.pendingInvites = [];
         saveData();
       }
@@ -250,16 +247,11 @@ wss.on('connection', ws => {
     }
 
     // ---- server invites ----
-    // Every invite now carries the inviter's id AND their current room id,
-    // so the receiving client can render a real "Join" button and, if
-    // tapped, actually move the invitee into that exact room (see
-    // 'join_server' below) rather than just displaying a name.
     if (msg.type === 'server_invite') {
       const me = ensurePlayer(myId);
       const targetId = String(msg.targetId || '');
-      const fromRoomId = playerRoom.get(myId) || null;
-      if (isOnline(targetId)) send(targetId, { type: 'server_invite', fromId: myId, fromName: me.name, fromCountry: me.country || null, fromRoomId });
-      else if (data.players[targetId]) { data.players[targetId].pendingInvites.push({ fromId: myId, fromName: me.name, fromCountry: me.country || null, fromRoomId }); saveData(); }
+      if (isOnline(targetId)) send(targetId, { type: 'server_invite', fromName: me.name, fromCountry: me.country || null });
+      else if (data.players[targetId]) { data.players[targetId].pendingInvites.push({ fromName: me.name, fromCountry: me.country || null }); saveData(); }
       return;
     }
     if (msg.type === 'server_invite_by_name') {
@@ -268,35 +260,9 @@ wss.on('connection', ws => {
       const entry = Object.entries(data.players).find(([id, p]) => id !== myId && p.name.toLowerCase() === targetName);
       if (!entry) { send(myId, { type: 'invite_sent', ok: false, name: msg.name }); return; }
       const [targetId, targetP] = entry;
-      const fromRoomId = playerRoom.get(myId) || null;
-      if (isOnline(targetId)) send(targetId, { type: 'server_invite', fromId: myId, fromName: me.name, fromCountry: me.country || null, fromRoomId });
-      else { targetP.pendingInvites.push({ fromId: myId, fromName: me.name, fromCountry: me.country || null, fromRoomId }); saveData(); }
+      if (isOnline(targetId)) send(targetId, { type: 'server_invite', fromName: me.name, fromCountry: me.country || null });
+      else { targetP.pendingInvites.push({ fromName: me.name, fromCountry: me.country || null }); saveData(); }
       send(myId, { type: 'invite_sent', ok: true, name: targetP.name });
-      return;
-    }
-
-    // Fired when the invited player actually taps "Join" on the invite
-    // toast. This is a real room move: the player is pulled out of
-    // whatever room auto-assignment gave them and placed into the
-    // inviter's room, capacity-checked against the same 20-player cap
-    // used everywhere else. The inviter (if still online, still in that
-    // room) and every other current member get a real notification that
-    // this player joined — nothing here is simulated or assumed.
-    if (msg.type === 'join_server') {
-      const me = ensurePlayer(myId);
-      const roomId = String(msg.roomId || '');
-      const result = joinSpecificRoom(myId, roomId);
-      if (!result.ok) {
-        send(myId, { type: 'join_server_result', ok: false, reason: result.reason, roomId });
-        return;
-      }
-      send(myId, { type: 'join_server_result', ok: true, roomId: result.roomId, roomCount: result.roomCount });
-      // Tell everyone already in that room (including the original
-      // inviter, if they're one of them) that this player just joined.
-      rooms.get(result.roomId).forEach(pid => {
-        if (pid === myId) return;
-        send(pid, { type: 'player_joined_server', id: myId, name: me.name, country: me.country || null, roomId: result.roomId, roomCount: result.roomCount });
-      });
       return;
     }
 
@@ -307,7 +273,6 @@ wss.on('connection', ws => {
     // to the other players currently in the same room *and* the same
     // level, so head-standing and any future co-op abilities only ever
     // apply between players who are actually looking at the same level.
-
 
     // Announce (or update) which level this player is on. Sent once on
     // entering PLAYING and again whenever the level changes (new level,
@@ -361,6 +326,29 @@ wss.on('connection', ws => {
         facing: msg.facing, onGround: !!msg.onGround, alive: msg.alive !== false,
         legPhase: msg.legPhase, isSpinning: !!msg.isSpinning, color: msg.color
       };
+      rooms.get(roomId).forEach(pid => {
+        if (pid === myId) return;
+        if (playerLevel.get(pid) !== levelIndex) return;
+        send(pid, out);
+      });
+      return;
+    }
+
+    // Emote wheel: a quick, ephemeral emoji pop-up above the sender's
+    // blob. Relayed the exact same way as 'state' above — a dumb
+    // broadcast to roommates on the same room *and* level, with zero
+    // game-logic significance. The server does not validate which emote
+    // was picked (that's a small fixed enum defined client-side); it
+    // only caps the id to a short string so a malformed/hostile client
+    // can't smuggle arbitrary payloads through this channel.
+    if (msg.type === 'emote') {
+      const roomId = playerRoom.get(myId);
+      if (!roomId || !rooms.has(roomId)) return;
+      const levelIndex = playerLevel.get(myId);
+      if (levelIndex === undefined) return;
+      const emoteId = String(msg.emoteId || '').slice(0, 32);
+      if (!emoteId) return;
+      const out = { type: 'peer_emote', id: myId, emoteId };
       rooms.get(roomId).forEach(pid => {
         if (pid === myId) return;
         if (playerLevel.get(pid) !== levelIndex) return;
