@@ -38,10 +38,23 @@ const PORT = process.env.PORT || 8080;
 const DATA_FILE = path.join(__dirname, 'data.json');
 const ROOM_CAP = 20;
 
+// The one reserved admin name. Case-insensitive: "Saw6970", "SAW6970", etc.
+// all refer to this same reserved slot. Whichever persisted player id first
+// claims it "owns" it forever after (ownership recorded in data.adminId);
+// every other id is permanently blocked from ever taking this name, even
+// while the owner is offline.
+const ADMIN_NAME = 'saw6970';
+const norm = s => String(s || '').trim().toLowerCase();
+
 // ---- Persistence: a real on-disk friends/players graph ----
 function loadData() {
-  try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
-  catch (e) { return { players: {} }; }
+  try {
+    const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (!d.players) d.players = {};
+    if (d.adminId === undefined) d.adminId = null;
+    return d;
+  }
+  catch (e) { return { players: {}, adminId: null }; }
 }
 function saveData() { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2)); }
 let data = loadData();
@@ -52,9 +65,64 @@ function normalizeCountry(cc) {
   return typeof cc === 'string' && /^[A-Za-z]{2}$/.test(cc) ? cc.toUpperCase() : null;
 }
 
+// True if `name` is already in use by some OTHER persisted player besides
+// `excludeId`. Case-insensitive, so "Blob", "blob" and "BLOB" all collide.
+function nameTaken(name, excludeId) {
+  const n = norm(name);
+  if (!n) return false;
+  return Object.entries(data.players).some(([id, p]) => id !== excludeId && norm(p.name) === n);
+}
+
+// Builds a name that's guaranteed free, based on whatever the player already
+// had (or "Player") plus a short numeric suffix, so a collision never just
+// silently reuses someone else's name.
+function pickFallbackName(id, base) {
+  const root = String(base || (data.players[id] && data.players[id].name) || 'Player').trim().slice(0, 12) || 'Player';
+  if (!nameTaken(root, id)) return root;
+  let n = 2;
+  while (nameTaken(root + n, id)) n++;
+  return (root + n).slice(0, 16);
+}
+
+// Decides what name `id` is actually allowed to end up with when it asks
+// for `requestedName`. Enforces two rules:
+//   1. Every name is unique (case-insensitive) across all players.
+//   2. "saw6970" is reserved: the first id ever to claim it becomes the
+//      permanent admin; nobody else can ever take that name afterward.
+// Returns { name, isAdmin, rejected } — `rejected` is true when the request
+// had to be overridden (name was taken/reserved), so the caller can tell
+// the client its requested name didn't stick.
+function resolveRequestedName(id, requestedName, fallbackBase) {
+  const requested = String(requestedName || '').trim().slice(0, 16);
+  const wantsAdminName = norm(requested) === ADMIN_NAME;
+
+  if (wantsAdminName) {
+    if (!data.adminId) {
+      // Nobody owns the admin name yet — this id claims it permanently.
+      data.adminId = id;
+      return { name: ADMIN_NAME, isAdmin: true, rejected: false };
+    }
+    if (data.adminId === id) {
+      // The rightful admin, reclaiming their own name.
+      return { name: ADMIN_NAME, isAdmin: true, rejected: false };
+    }
+    // Someone else trying to take/impersonate the admin name — blocked.
+    return { name: pickFallbackName(id, fallbackBase), isAdmin: false, rejected: true };
+  }
+
+  // If the current admin renames away from "saw6970", they give it up
+  // (the name becomes claimable again by whoever asks for it next).
+  if (data.adminId === id) data.adminId = null;
+
+  if (requested && nameTaken(requested, id)) {
+    return { name: pickFallbackName(id, fallbackBase), isAdmin: false, rejected: true };
+  }
+  return { name: requested || pickFallbackName(id, fallbackBase), isAdmin: false, rejected: false };
+}
+
 function ensurePlayer(id, name, country) {
   if (!data.players[id]) {
-    data.players[id] = { name: name || 'Player', friends: [], incomingRequests: [], pendingInvites: [], country: normalizeCountry(country), createdAt: Date.now() };
+    data.players[id] = { name: name || 'Player', friends: [], incomingRequests: [], pendingInvites: [], country: normalizeCountry(country), createdAt: Date.now(), isAdmin: false };
   }
   const p = data.players[id];
   if (name) p.name = name;
@@ -64,6 +132,7 @@ function ensurePlayer(id, name, country) {
   if (!p.incomingRequests) p.incomingRequests = [];
   if (!p.pendingInvites) p.pendingInvites = [];
   if (p.country === undefined) p.country = null;
+  if (p.isAdmin === undefined) p.isAdmin = (data.adminId === id);
   return p;
 }
 
@@ -149,10 +218,16 @@ wss.on('connection', ws => {
     if (msg.type === 'hello') {
       myId = String(msg.id || '').slice(0, 64);
       if (!myId) return;
-      const name = String(msg.name || 'Player').slice(0, 16);
+      const requestedName = String(msg.name || 'Player').slice(0, 16);
       const country = normalizeCountry(msg.country);
       connections.set(myId, ws);
-      const p = ensurePlayer(myId, name, country);
+
+      // Resolve the name through the uniqueness + admin-reservation rules
+      // BEFORE persisting anything, so a taken/reserved name never lands
+      // in data.players even for a moment.
+      const resolved = resolveRequestedName(myId, requestedName, requestedName);
+      const p = ensurePlayer(myId, resolved.name, country);
+      p.isAdmin = resolved.isAdmin;
       saveData();
 
       const roomId = assignRoom(myId);
@@ -160,6 +235,9 @@ wss.on('connection', ws => {
         type: 'welcome',
         roomId,
         roomCount: roomCount(roomId),
+        name: p.name,
+        isAdmin: resolved.isAdmin,
+        nameRejected: resolved.rejected,
         friends: p.friends.map(fid => ({ id: fid, name: data.players[fid] ? data.players[fid].name : '(deleted)', country: data.players[fid] ? (data.players[fid].country || null) : null, online: isOnline(fid) })),
         incomingRequests: p.incomingRequests.map(r => ({ id: r.id, fromId: r.fromId, fromName: r.fromName, fromCountry: r.fromCountry || null, ts: r.ts }))
       });
@@ -189,10 +267,14 @@ wss.on('connection', ws => {
 
     // ---- name changes ----
     if (msg.type === 'set_name') {
-      const name = String(msg.name || '').trim().slice(0, 16);
-      if (name) {
-        ensurePlayer(myId).name = name;
+      const requestedName = String(msg.name || '').trim().slice(0, 16);
+      if (requestedName) {
+        const resolved = resolveRequestedName(myId, requestedName, requestedName);
+        const p = ensurePlayer(myId);
+        p.name = resolved.name;
+        p.isAdmin = resolved.isAdmin;
         saveData();
+        send(myId, { type: 'name_set', name: p.name, isAdmin: resolved.isAdmin, rejected: resolved.rejected });
         broadcastPresence(myId, true);
       }
       return;
@@ -369,10 +451,11 @@ wss.on('connection', ws => {
           p.incomingRequests = (p.incomingRequests || []).filter(r => r.fromId !== myId);
           p.pendingInvites = (p.pendingInvites || []).filter(inv => inv.fromId !== myId);
         });
+        if (data.adminId === myId) data.adminId = null; // free up "saw6970" again
+        broadcastPresence(myId, false);
         delete data.players[myId];
         saveData();
       }
-      broadcastPresence(myId, false);
       notifyLeftLevel(myId);
       leaveRoom(myId);
       ws.send(JSON.stringify({ type: 'account_deleted' }));
