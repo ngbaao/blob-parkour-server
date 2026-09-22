@@ -31,6 +31,8 @@
 // ---------------------------------------------------------------------
 
 const { WebSocketServer } = require('ws');
+const http = require('http');
+const url = require('url');
 const fs = require('fs');
 const path = require('path');
 
@@ -163,10 +165,147 @@ function notifyLeftLevel(id) {
     rooms.get(roomId).forEach(pid => { if (pid !== id) send(pid, { type: 'peer_left_level', id }); });
   }
 }
+// Fully deletes a player: unfriends them from everyone, strips their
+// pending incoming requests from other players' lists, releases their
+// claimed name back into the pool, removes them from data.json, and (if
+// they're currently connected) notifies and disconnects their live
+// socket. This is the ONE place that knows how to delete a player —
+// both the player's own "delete my account" button (via the
+// 'delete_account' message) and the admin panel's delete button call
+// this same function, so the two can never drift out of sync with each
+// other or leave a player half-deleted.
+function deletePlayer(id) {
+  const me = data.players[id];
+  if (!me) return false;
+  me.friends.forEach(fid => {
+    const f = data.players[fid];
+    if (f) f.friends = f.friends.filter(fid2 => fid2 !== id);
+  });
+  Object.values(data.players).forEach(p => { p.incomingRequests = (p.incomingRequests || []).filter(r => r.fromId !== id); });
+  releaseName(me.name, id);
+  delete data.players[id];
+  saveData();
+
+  broadcastPresence(id, false);
+  notifyLeftLevel(id);
+  leaveRoom(id);
+  const sock = connections.get(id);
+  if (sock) {
+    try { sock.send(JSON.stringify({ type: 'account_deleted' })); } catch (e) {}
+    try { sock.close(); } catch (e) {}
+  }
+  connections.delete(id);
+  return true;
+}
+
 const shortId = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 
-const wss = new WebSocketServer({ port: PORT });
-console.log('Blob Parkour multiplayer server listening on port ' + PORT);
+// ---- Admin panel: view every player, delete any by name ----
+// Reachable only over plain HTTP GET/POST on the SAME server/port as the
+// game's WebSocket connections (no second service, no second port to
+// expose). Every request must supply the exact ADMIN_SECRET as a query
+// parameter (?secret=...) or the request is refused before any player
+// data is read or returned — matching the same fail-closed rule already
+// used for granting admin in-game: if ADMIN_SECRET isn't set on this
+// server at all, the panel refuses every request, full stop.
+const crypto = require('crypto');
+function secretMatches(candidate) {
+  if (!ADMIN_SECRET || typeof candidate !== 'string') return false;
+  const a = Buffer.from(candidate);
+  const b = Buffer.from(ADMIN_SECRET);
+  // timingSafeEqual throws if lengths differ, so check that first — but a
+  // length mismatch is itself just "no match", not a special case to leak.
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+
+function renderAdminPage(secret) {
+  const rows = Object.entries(data.players)
+    .sort((a, b) => (b[1].createdAt || 0) - (a[1].createdAt || 0))
+    .map(([id, p]) => {
+      const online = isOnline(id);
+      return '<tr>' +
+        '<td>' + escapeHtml(p.name) + (p.admin ? ' <span class="admin-tag">ADMIN</span>' : '') + '</td>' +
+        '<td class="muted">' + escapeHtml(id) + '</td>' +
+        '<td>' + (online ? '<span class="online">online</span>' : '<span class="muted">offline</span>') + '</td>' +
+        '<td>' + (p.friends ? p.friends.length : 0) + '</td>' +
+        '<td class="muted">' + (p.createdAt ? new Date(p.createdAt).toLocaleString() : '—') + '</td>' +
+        '<td><form method="POST" action="/admin/delete?secret=' + encodeURIComponent(secret) + '" onsubmit="return confirm(\'Permanently delete \\\'' + escapeHtml(p.name).replace(/'/g, "\\'") + '\\\'? This cannot be undone.\');">' +
+        '<input type="hidden" name="id" value="' + escapeHtml(id) + '">' +
+        '<button type="submit" class="delete-btn">Delete</button></form></td>' +
+        '</tr>';
+    }).join('\n');
+
+  return '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Blob Parkour — Admin</title>' +
+    '<style>' +
+    'body{font-family:system-ui,sans-serif;background:#051620;color:#e2e8f0;padding:24px;max-width:900px;margin:0 auto;}' +
+    'h1{color:#ffcc00;font-size:20px;}' +
+    'table{width:100%;border-collapse:collapse;margin-top:16px;}' +
+    'th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #1e293b;font-size:14px;}' +
+    'th{color:#94a3b8;font-weight:600;font-size:12px;text-transform:uppercase;}' +
+    '.muted{color:#64748b;font-size:12px;}' +
+    '.online{color:#4ade80;}' +
+    '.admin-tag{background:#facc15;color:#051620;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;margin-left:6px;}' +
+    '.delete-btn{background:#3f1d1d;color:#fecaca;border:1px solid #f87171;padding:5px 12px;border-radius:5px;cursor:pointer;font-size:13px;}' +
+    '.delete-btn:hover{background:#f87171;color:#1e0a0a;}' +
+    '.count{color:#94a3b8;font-size:13px;margin-top:4px;}' +
+    '</style></head><body>' +
+    '<h1>Blob Parkour — Players</h1>' +
+    '<div class="count">' + Object.keys(data.players).length + ' total accounts</div>' +
+    '<table><thead><tr><th>Name</th><th>ID</th><th>Status</th><th>Friends</th><th>Created</th><th></th></tr></thead>' +
+    '<tbody>' + (rows || '<tr><td colspan="6" class="muted">No players yet.</td></tr>') + '</tbody></table>' +
+    '</body></html>';
+}
+
+function handleHttpRequest(req, res) {
+  const parsed = url.parse(req.url, true);
+  const pathname = parsed.pathname;
+
+  if (pathname === '/admin' && req.method === 'GET') {
+    if (!secretMatches(parsed.query.secret)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('Forbidden');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderAdminPage(parsed.query.secret));
+    return;
+  }
+
+  if (pathname === '/admin/delete' && req.method === 'POST') {
+    if (!secretMatches(parsed.query.secret)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('Forbidden');
+      return;
+    }
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > 10000) req.destroy(); // guard against an absurdly large body
+    });
+    req.on('end', () => {
+      const params = new url.URLSearchParams(body);
+      const id = params.get('id');
+      if (id) deletePlayer(id);
+      res.writeHead(302, { Location: '/admin?secret=' + encodeURIComponent(parsed.query.secret) });
+      res.end();
+    });
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Not found');
+}
+
+const httpServer = http.createServer(handleHttpRequest);
+const wss = new WebSocketServer({ server: httpServer });
+httpServer.listen(PORT, () => {
+  console.log('Blob Parkour multiplayer server listening on port ' + PORT);
+});
 
 wss.on('connection', ws => {
   let myId = null;
@@ -433,25 +572,10 @@ wss.on('connection', ws => {
       return;
     }
 
-    // ---- account deletion ----
+    // ---- account deletion (self) ----
     if (msg.type === 'delete_account') {
-      const me = data.players[myId];
-      if (me) {
-        me.friends.forEach(fid => {
-          const f = data.players[fid];
-          if (f) f.friends = f.friends.filter(id => id !== myId);
-        });
-        Object.values(data.players).forEach(p => { p.incomingRequests = (p.incomingRequests || []).filter(r => r.fromId !== myId); });
-        releaseName(me.name, myId);
-        delete data.players[myId];
-        saveData();
-      }
-      broadcastPresence(myId, false);
-      notifyLeftLevel(myId);
-      leaveRoom(myId);
-      ws.send(JSON.stringify({ type: 'account_deleted' }));
-      connections.delete(myId);
-      ws.close();
+      deletePlayer(myId); // this socket IS connections.get(myId) right now, so deletePlayer's own
+                           // notify+close logic handles messaging and closing this exact ws already
       return;
     }
   });
