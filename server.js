@@ -578,6 +578,50 @@ wss.on('connection', ws => {
                            // notify+close logic handles messaging and closing this exact ws already
       return;
     }
+
+    // ---- admin panel: get all players ----
+    if (msg.type === 'admin_get_players') {
+      const me = data.players[myId];
+      if (!me || !me.admin) {
+        send(myId, { type: 'admin_error', message: 'Admin access required' });
+        return;
+      }
+      const players = Object.entries(data.players).map(([id, p]) => ({
+        id,
+        name: p.name,
+        admin: p.admin,
+        online: isOnline(id),
+        friends: p.friends || [],
+        createdAt: p.createdAt
+      }));
+      send(myId, { type: 'admin_player_list', players });
+      return;
+    }
+
+    // ---- admin panel: delete player by ID ----
+    if (msg.type === 'admin_delete_player') {
+      const me = data.players[myId];
+      if (!me || !me.admin) {
+        send(myId, { type: 'admin_error', message: 'Admin access required' });
+        return;
+      }
+      const targetId = String(msg.id || '');
+      if (!targetId) {
+        send(myId, { type: 'admin_error', message: 'Invalid player ID' });
+        return;
+      }
+      if (targetId === myId) {
+        send(myId, { type: 'admin_error', message: 'Cannot delete your own account' });
+        return;
+      }
+      const deleted = deletePlayer(targetId);
+      if (deleted) {
+        send(myId, { type: 'admin_delete_success', id: targetId });
+      } else {
+        send(myId, { type: 'admin_error', message: 'Player not found' });
+      }
+      return;
+    }
   });
 
   ws.on('close', () => {
